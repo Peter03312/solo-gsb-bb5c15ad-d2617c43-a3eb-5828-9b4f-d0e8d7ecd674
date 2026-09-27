@@ -49,6 +49,12 @@ import {
   refItemKey,
   summarizeRefDiff
 } from '../src/lib/refdiff';
+import {
+  buildSpeedFixPlan,
+  countReadableGraphemes,
+  findOverspeedCues,
+  targetDurationMs
+} from '../src/lib/readingSpeed';
 
 let fail = 0;
 function assert(cond: boolean, msg: string) {
@@ -714,6 +720,110 @@ assert(validateSession(nullAudio).ok, '无音频指纹的会话合法');
   const emptyRef = buildRefDiff(one, [])!;
   assert(emptyRef.pairs.length === 0 && emptyRef.currentOnly.length === 1, '参考轨为空：全部为当前独有');
   assert(MAX_PAIR_CELLS > 0, '配对矩阵单元格上限为正数');
+}
+
+/* ---------------- 阅读速度修复 ---------------- */
+
+// 28. 字素簇计数：去空白与标点 + Unicode 字素簇
+{
+  assert(countReadableGraphemes('你好， 世界！') === 4, '去空白与标点后计 4 字');
+  assert(countReadableGraphemes('  Hello,\nWorld! ') === 10, '多行空白与标点不计入');
+  assert(countReadableGraphemes('ＡＢＣ．１２３') === 6, 'NFKC 折叠全角后计 6 字');
+  assert(countReadableGraphemes('…') === 0, '纯标点计 0 字');
+  assert(countReadableGraphemes('é') === 1, '组合字符整体算 1 字素簇');
+  assert(countReadableGraphemes('👨‍👩‍👧') === 1, 'ZWJ 序列整体算 1 字素簇');
+  assert(countReadableGraphemes('') === 0, '空文本计 0 字');
+}
+
+// 29. 目标时长向上取整到毫秒 + 超速检测（严格大于阈值）
+{
+  assert(targetDurationMs(10, 5) === 2000, '恰好整除不多进 1ms');
+  assert(targetDurationMs(7, 3) === 2334, '7/3 向上取整到 2334ms');
+  const speedCues = [
+    { id: 'a', start: 1, end: 2, text: '一二三四五六七八九十' }, // 10 字 / 1s = 10 字/秒
+    { id: 'b', start: 3, end: 6, text: '一二三' }, // 1 字/秒
+    { id: 'c', start: 6.2, end: 8, text: '！！！' } // 0 字
+  ];
+  const entries = findOverspeedCues(speedCues, 5);
+  assert(entries.length === 1 && entries[0].cue.id === 'a', '只有 a 超速被列出');
+  assert(entries[0].chars === 10 && entries[0].cps === 10, '字数与速度正确');
+  assert(entries[0].targetDuration === 2 && entries[0].extendMs === 1000, '目标 2s，需延长 1000ms');
+  assert(findOverspeedCues(speedCues, 10).length === 0, '恰好等于阈值不算超速（严格大于）');
+  assert(findOverspeedCues(speedCues, 0).length === 0, '非法阈值返回空');
+}
+
+// 30. 修复预览：均分、受限转移与缺少毫秒数
+{
+  const SC = { minDuration: 0.5, minGap: 0.1 };
+  const solo = [{ id: 'a', start: 5, end: 6, text: '一二三四五六七八九十' }];
+
+  // 无邻居、无音频：延长量均分到起止两侧
+  let plan = buildSpeedFixPlan(solo, 'a', 5, SC, 0)!;
+  assert(plan.extendMs === 1000 && plan.leftMs === 500 && plan.rightMs === 500, '延长量均分到两侧');
+  assert(plan.newStart === 4.5 && plan.newEnd === 6.5, '均分后的新起止时间');
+  assert(plan.missingMs === 0 && !plan.rightRoomLimited, '余量充足且右侧无限制');
+
+  // 奇数毫秒：起点侧多分 1ms（10 字 / 4.9 字每秒 -> 目标 2041ms，延长 1041ms）
+  plan = buildSpeedFixPlan(solo, 'a', 4.9, SC, 0)!;
+  assert(plan.extendMs === 1041 && plan.leftMs === 521 && plan.rightMs === 520, '奇数毫秒起点侧多分 1ms');
+
+  // 左侧受 0 秒限制：未分配量转给右侧
+  const atZero = [{ id: 'a', start: 0.2, end: 1.2, text: '一二三四五六七八九十' }];
+  plan = buildSpeedFixPlan(atZero, 'a', 5, SC, 0)!;
+  assert(plan.leftRoomMs === 200 && plan.leftMs === 200 && plan.rightMs === 800, '左侧受 0 秒限制，余量转给右侧');
+  assert(plan.newStart === 0 && plan.newEnd === 2 && plan.missingMs === 0, '新起点贴 0 秒');
+
+  // 右侧受下一条最小间隔限制：未分配量转给左侧
+  const tightNext = [
+    { id: 'a', start: 1, end: 2, text: '一二三四五六七八九十' },
+    { id: 'b', start: 2.3, end: 3, text: 'x' }
+  ];
+  plan = buildSpeedFixPlan(tightNext, 'a', 5, SC, 0)!;
+  assert(plan.rightRoomMs === 200 && plan.rightMs === 200 && plan.leftMs === 800, '右侧受最小间隔限制，余量转给左侧');
+  assert(plan.newEnd === 2.2 && plan.missingMs === 0, '新终点与下一条保持最小间隔');
+
+  // 右侧受已加载音频终点限制
+  const nearEnd = [{ id: 'a', start: 1, end: 2, text: '一二三四五六七八九十' }];
+  plan = buildSpeedFixPlan(nearEnd, 'a', 5, SC, 2.3)!;
+  assert(plan.rightRoomMs === 300 && plan.rightMs === 300 && plan.leftMs === 700, '右侧受音频终点限制，余量转给左侧');
+  assert(plan.newEnd === 2.3 && plan.missingMs === 0, '新终点贴音频结尾');
+
+  // 两侧余量都不足：报告缺少毫秒数，禁止提交（原字幕不变）
+  const boxed = [
+    { id: 'p', start: 0, end: 0.9, text: 'p' },
+    { id: 'a', start: 1, end: 2, text: '一二三四五六七八九十' },
+    { id: 'n', start: 2.2, end: 3, text: 'n' }
+  ];
+  plan = buildSpeedFixPlan(boxed, 'a', 5, SC, 0)!;
+  assert(plan.leftRoomMs === 0 && plan.rightRoomMs === 100, '两侧余量分别为 0 与 100ms');
+  assert(plan.missingMs === 900 && plan.leftMs === 0 && plan.rightMs === 100, '还缺 900ms，禁止提交');
+  assert(plan.fixedAll[1].start === 1 && plan.fixedAll[1].end === 2.1, '余量不足时仅尽力分配，不得提交');
+
+  // 无效输入：字幕不存在 / 非法阈值 / 未超速
+  assert(buildSpeedFixPlan(solo, 'ghost', 5, SC, 0) === null, '字幕不存在返回 null');
+  assert(buildSpeedFixPlan(solo, 'a', 0, SC, 0) === null, '非法阈值返回 null');
+  const calm = [{ id: 'a', start: 0, end: 5, text: '你好' }];
+  assert(buildSpeedFixPlan(calm, 'a', 5, SC, 0) === null, '未超速字幕无修复计划');
+}
+
+// 31. 合法修复作为一次历史记录提交：可撤销/重做并参与现有 SRT 导出
+{
+  const SC = { minDuration: 0.5, minGap: 0.1 };
+  const solo = [{ id: 'a', start: 5, end: 6, text: '一二三四五六七八九十' }];
+  const okPlan = buildSpeedFixPlan(solo, 'a', 5, SC, 0)!;
+  assert(okPlan.missingMs === 0, '修复计划可提交');
+  let h5 = initHistory(solo);
+  h5 = commitHistory(h5, okPlan.fixedAll);
+  assert(h5.present[0].start === 4.5 && h5.present[0].end === 6.5 && h5.past.length === 1, '修复结果作为一次历史提交');
+  h5 = undoHistory(h5);
+  assert(h5.present[0].start === 5 && h5.present[0].end === 6, '撤销恢复原时间码');
+  h5 = redoHistory(h5);
+  assert(h5.present[0].start === 4.5, '重做恢复修复结果');
+  assert(
+    serializeSrt(h5.present).includes('00:00:04,500 --> 00:00:06,500'),
+    '修复结果可由现有 SRT 导出'
+  );
+  assert(findOverspeedCues(h5.present, 5).length === 0, '修复后不再超速');
 }
 
 process.exit(fail ? 1 : 0);

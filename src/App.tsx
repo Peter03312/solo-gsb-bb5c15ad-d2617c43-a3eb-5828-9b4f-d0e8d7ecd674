@@ -5,7 +5,9 @@ import CueList from './components/CueList';
 import ShadowPanel from './components/ShadowPanel';
 import DriftPanel from './components/DriftPanel';
 import RefDiffPanel from './components/RefDiffPanel';
+import SpeedPanel from './components/SpeedPanel';
 import { buildRefDiff, summarizeRefDiff, type RefDiffItem } from './lib/refdiff';
+import { buildSpeedFixPlan, findOverspeedCues } from './lib/readingSpeed';
 import type { Constraints, Cue, DriftPreview, SilenceStatus } from './types';
 import { formatClock, parseSrt, serializeSrt } from './lib/srt';
 import {
@@ -135,6 +137,11 @@ export default function App() {
   const [refTrack, setRefTrack] = useState<{ name: string; cues: Cue[] } | null>(null);
   // 已配对条目起止偏差的审阅阈值（秒）：起点或终点偏差严格大于即列出
   const [refThreshold, setRefThreshold] = useState(0.5);
+
+  // 阅读速度修复：可调字数/秒阈值与选中的待修复字幕；
+  // 阈值不入会话快照（与参考阈值一致），选择随 SRT 切换 / 会话恢复清空
+  const [speedThreshold, setSpeedThreshold] = useState(15);
+  const [speedFixId, setSpeedFixId] = useState<string | null>(null);
 
   /* ---------------- 本地会话恢复 / 自动保存 ---------------- */
   // 当前工作区绑定的会话 id：导入 SRT 时新建；恢复会话时沿用；空白工作区为 null
@@ -602,6 +609,54 @@ export default function App() {
     [refDiff, refThreshold]
   );
 
+  /* ---------------- 阅读速度修复 ---------------- */
+
+  // 超速条目：随当前字幕与阈值实时重算（去空白标点后的字素簇数 ÷ 时长）
+  const speedEntries = useMemo(
+    () => findOverspeedCues(cues, speedThreshold),
+    [cues, speedThreshold]
+  );
+  // 修复预览：随字幕、最小间隔约束与已加载音频时长实时重算；条目不再超速时计划失效
+  const speedPlan = useMemo(
+    () =>
+      speedFixId
+        ? buildSpeedFixPlan(cues, speedFixId, speedThreshold, constraints, duration)
+        : null,
+    [cues, speedFixId, speedThreshold, constraints, duration]
+  );
+
+  // 条目不再超速（已修复 / 阈值调高 / 字幕被改）时自动清空选择
+  useEffect(() => {
+    if (speedFixId && !speedEntries.some((e) => e.cue.id === speedFixId)) {
+      setSpeedFixId(null);
+    }
+  }, [speedFixId, speedEntries]);
+
+  /** 选中待修复条目：同步选中主列表 / 时间轴对应字幕并定位播放头（直接 setSelectedId 以保留漂移区间） */
+  const handleSpeedSelect = useCallback(
+    (id: string) => {
+      setSpeedFixId(id);
+      setSelectedId(id);
+      setFocusNonce((n) => n + 1);
+      const cue = cues.find((c) => c.id === id);
+      if (cue) seek(cue.start);
+    },
+    [cues, seek]
+  );
+
+  const clearSpeedFix = useCallback(() => setSpeedFixId(null), []);
+
+  /** 合法修复作为一次历史记录提交（整体可撤销/重做，走现有 SRT 导出） */
+  const applySpeedFix = useCallback(() => {
+    if (!speedPlan || speedPlan.missingMs > 0) return;
+    commit(speedPlan.fixedAll);
+    pushToast(
+      'info',
+      `已修复阅读速度：延长 ${speedPlan.extendMs}ms（起点 −${speedPlan.leftMs}ms · 终点 +${speedPlan.rightMs}ms）`
+    );
+    setSpeedFixId(null);
+  }, [speedPlan, commit, pushToast]);
+
   /* ---------------- SRT ---------------- */
 
   const handleImportSrt = useCallback(
@@ -615,6 +670,7 @@ export default function App() {
         }
         clearDrift(); // 切换字幕文件：清空区间漂移预览
         setRefTrack(null); // 切换当前 SRT：参考轨与审阅状态仅跟随当前页面的这份字幕
+        setSpeedFixId(null); // 切换当前 SRT：清空阅读速度修复选择
         // 新 SRT = 新会话：重置修订号 / 创建时间，并丢弃上一文件的音频与等待态
         if (audioUrlRef.current) {
           URL.revokeObjectURL(audioUrlRef.current);
@@ -1013,6 +1069,7 @@ export default function App() {
       setDriftEndId(null);
       setDriftInputs(null);
       setRefTrack(null); // 恢复会话整体替换当前字幕：参考轨不跨工作区保留
+      setSpeedFixId(null); // 恢复会话整体替换当前字幕：清空阅读速度修复选择
       setCurrentTime(0);
       setDuration(0);
       setIsPlaying(false);
@@ -1092,6 +1149,7 @@ export default function App() {
       parts.push(`区间漂移待输入目标锚点（${driftRangeInfo.count} 条）`);
     }
     if (cues.length > 0) parts.push(`已记录 ${history.past.length} 次调整`);
+    if (speedEntries.length > 0) parts.push(`阅读速度超限 ${speedEntries.length} 条`);
     if (refTrack && refStats) {
       parts.push(
         `参考轨 ${refTrack.cues.length} 条 · 配对 ${refStats.paired} · 偏差超限 ${refStats.deviated} · 独有 ${refStats.currentOnly}+${refStats.referenceOnly}`
@@ -1118,6 +1176,7 @@ export default function App() {
     shadowBusy,
     driftPlan,
     driftRangeInfo,
+    speedEntries.length,
     audioPending,
     sessionId,
     autoSave,
@@ -1261,6 +1320,17 @@ export default function App() {
             onImport={handleImportRefSrt}
             onClear={handleClearRef}
             onLocate={handleRefLocate}
+          />
+          <SpeedPanel
+            cues={cues}
+            entries={speedEntries}
+            threshold={speedThreshold}
+            onThresholdChange={setSpeedThreshold}
+            selectedId={speedFixId}
+            plan={speedPlan}
+            onSelect={handleSpeedSelect}
+            onClearSelection={clearSpeedFix}
+            onApply={applySpeedFix}
           />
         </section>
         <CueList
