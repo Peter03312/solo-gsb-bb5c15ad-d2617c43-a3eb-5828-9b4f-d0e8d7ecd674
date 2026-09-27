@@ -5,7 +5,17 @@ import CueList from './components/CueList';
 import ShadowPanel from './components/ShadowPanel';
 import DriftPanel from './components/DriftPanel';
 import RefDiffPanel from './components/RefDiffPanel';
-import { buildRefDiff, summarizeRefDiff, type RefDiffItem } from './lib/refdiff';
+import SpeedPanel from './components/SpeedPanel';
+import {
+  buildRefDiff,
+  summarizeRefDiff,
+  type RefDiffItem
+} from './lib/refdiff';
+import {
+  buildReadingSpeed,
+  planReadingSpeedFix,
+  type ReadingSpeedFix
+} from './lib/readingSpeed';
 import type { Constraints, Cue, DriftPreview, SilenceStatus } from './types';
 import { formatClock, parseSrt, serializeSrt } from './lib/srt';
 import {
@@ -135,6 +145,10 @@ export default function App() {
   const [refTrack, setRefTrack] = useState<{ name: string; cues: Cue[] } | null>(null);
   // 已配对条目起止偏差的审阅阈值（秒）：起点或终点偏差严格大于即列出
   const [refThreshold, setRefThreshold] = useState(0.5);
+
+  // 阅读速度修复：可调字/秒阈值与面板内选中条目（仅页面内存；切换 SRT 清空选择）
+  const [speedThreshold, setSpeedThreshold] = useState(10);
+  const [speedSelectedId, setSpeedSelectedId] = useState<string | null>(null);
 
   /* ---------------- 本地会话恢复 / 自动保存 ---------------- */
   // 当前工作区绑定的会话 id：导入 SRT 时新建；恢复会话时沿用；空白工作区为 null
@@ -602,6 +616,55 @@ export default function App() {
     [refDiff, refThreshold]
   );
 
+  /* ---------------- 阅读速度修复 ---------------- */
+
+  // 字数 = 去空白与标点后的 Unicode 字素簇数；随字幕 / 阈值实时重算
+  const speedEntries = useMemo(
+    () => buildReadingSpeed(cues, speedThreshold),
+    [cues, speedThreshold]
+  );
+  const speedOverEntries = useMemo(() => speedEntries.filter((e) => e.over), [speedEntries]);
+  const speedOverSet = useMemo(() => new Set(speedOverEntries.map((e) => e.cueId)), [speedOverEntries]);
+  const speedCpsById = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const e of speedEntries) m.set(e.cueId, e.cps);
+    return m;
+  }, [speedEntries]);
+
+  const speedSelectedCue = useMemo(
+    () => cues.find((c) => c.id === speedSelectedId) ?? null,
+    [cues, speedSelectedId]
+  );
+  const speedSelectedMetrics = useMemo(
+    () => speedEntries.find((e) => e.cueId === speedSelectedId) ?? null,
+    [speedEntries, speedSelectedId]
+  );
+  // 延长预览：随选中条目、字幕、约束（最小间隔）、音频终点、阈值实时重算
+  const speedFix = useMemo<ReadingSpeedFix | null>(() => {
+    if (!speedSelectedId) return null;
+    return planReadingSpeedFix(cues, speedSelectedId, speedThreshold, constraints, duration);
+  }, [speedSelectedId, cues, speedThreshold, constraints, duration]);
+
+  /** 选中超速条目：与全局选中同步（定位时间轴 / 列表），但不抢播放头 */
+  const handleSpeedSelect = useCallback((id: string | null) => {
+    setSpeedSelectedId(id);
+    if (id) {
+      setSelectedId(id);
+      setFocusNonce((n) => n + 1);
+    }
+  }, []);
+
+  /** 合法延长方案作为一次历史操作提交；不足时按钮禁用，不会走到这里 */
+  const applySpeedFix = useCallback(() => {
+    if (!speedFix || !speedFix.feasible || !speedFix.nextCues) return;
+    commit(speedFix.nextCues);
+    pushToast(
+      'info',
+      `已应用阅读速度修复：起点 −${speedFix.left.takeMs}ms · 终点 +${speedFix.right.takeMs}ms · 共延长 ${speedFix.needMs}ms`
+    );
+    setSpeedSelectedId(null);
+  }, [speedFix, commit, pushToast]);
+
   /* ---------------- SRT ---------------- */
 
   const handleImportSrt = useCallback(
@@ -615,6 +678,7 @@ export default function App() {
         }
         clearDrift(); // 切换字幕文件：清空区间漂移预览
         setRefTrack(null); // 切换当前 SRT：参考轨与审阅状态仅跟随当前页面的这份字幕
+        setSpeedSelectedId(null); // 切换当前 SRT：清空阅读速度修复选择
         // 新 SRT = 新会话：重置修订号 / 创建时间，并丢弃上一文件的音频与等待态
         if (audioUrlRef.current) {
           URL.revokeObjectURL(audioUrlRef.current);
@@ -1013,6 +1077,7 @@ export default function App() {
       setDriftEndId(null);
       setDriftInputs(null);
       setRefTrack(null); // 恢复会话整体替换当前字幕：参考轨不跨工作区保留
+      setSpeedSelectedId(null); // 恢复会话整体替换当前字幕：阅读速度选择不跨工作区保留
       setCurrentTime(0);
       setDuration(0);
       setIsPlaying(false);
@@ -1097,6 +1162,9 @@ export default function App() {
         `参考轨 ${refTrack.cues.length} 条 · 配对 ${refStats.paired} · 偏差超限 ${refStats.deviated} · 独有 ${refStats.currentOnly}+${refStats.referenceOnly}`
       );
     }
+    if (speedOverEntries.length > 0) {
+      parts.push(`阅读速度超限 ${speedOverEntries.length} 条（>${speedThreshold} 字/秒）`);
+    }
     if (audioPending) parts.push('等待重新选择音频（播放已停用，编辑/导出不受影响）');
     if (sessionId) {
       if (!autoSave) parts.push('自动保存已停用');
@@ -1123,7 +1191,9 @@ export default function App() {
     autoSave,
     saveStatus,
     refTrack,
-    refStats
+    refStats,
+    speedOverEntries,
+    speedThreshold
   ]);
 
   return (
@@ -1219,6 +1289,7 @@ export default function App() {
             loopRange={loopActive ? loopRange : null}
             driftPreview={driftPreview}
             focusNonce={focusNonce}
+            speedOverIds={speedOverSet}
             onSelect={handleSelectCue}
             onSeek={seekAndPlay}
             onCommit={commit}
@@ -1262,6 +1333,19 @@ export default function App() {
             onClear={handleClearRef}
             onLocate={handleRefLocate}
           />
+          <SpeedPanel
+            overEntries={speedOverEntries}
+            totalCount={cues.length}
+            threshold={speedThreshold}
+            onThresholdChange={setSpeedThreshold}
+            selectedId={speedSelectedId}
+            onSelect={handleSpeedSelect}
+            selectedCue={speedSelectedCue}
+            selectedMetrics={speedSelectedMetrics}
+            fix={speedFix}
+            audioLoaded={hasAudio}
+            onApply={applySpeedFix}
+          />
         </section>
         <CueList
           cues={cues}
@@ -1269,6 +1353,8 @@ export default function App() {
           selectedId={selectedId}
           driftRangeIds={driftRangeInfo?.ids ?? null}
           driftConflictId={driftConflictId}
+          speedOverIds={speedOverSet}
+          speedCpsById={speedCpsById}
           focusNonce={focusNonce}
           onSelect={handleSelectCue}
           onExtendRange={handleExtendDriftRange}

@@ -24,6 +24,8 @@ interface TimelineProps {
   driftPreview: DriftPreview | null;
   /** 变化时强制重新滚动到选中字幕（定位冲突时选中项可能未变） */
   focusNonce: number;
+  /** 阅读速度超过阈值的字幕 id 集合（角标高亮） */
+  speedOverIds: Set<string>;
   onSelect: (id: string | null) => void;
   onSeek: (t: number) => void;
   /** 合法拖放结束：提交边界并进入历史栈 */
@@ -84,6 +86,7 @@ export default function Timeline({
   loopRange,
   driftPreview,
   focusNonce,
+  speedOverIds,
   onSelect,
   onSeek,
   onCommit,
@@ -443,7 +446,8 @@ export default function Timeline({
                   selected && 'selected',
                   active && 'playing',
                   invalid && 'invalid',
-                  driftSourceSet.has(cue.id) && 'drift-source'
+                  driftSourceSet.has(cue.id) && 'drift-source',
+                  speedOverIds.has(cue.id) && 'speed-over'
                 ].filter(Boolean).join(' ')}
                 style={{ left, width, top: 12, height: LANE_HEIGHT }}
                 title={`${formatClock(cue.start)} → ${formatClock(cue.end)}\n${cue.text.replace(/\n/g, ' ')}`}
@@ -469,7 +473,10 @@ export default function Timeline({
                   <span className="cue-time">
                     {formatClock(cue.start)} – {formatClock(cue.end)}
                   </span>
-                  <span className="cue-text">{cue.text.split('\n')[0]}</span>
+                  <span className="cue-text">
+                    {speedOverIds.has(cue.id) && <span className="cue-speed-flag" title="阅读速度超过当前阈值">⏩</span>}
+                    {cue.text.split('\n')[0]}
+                  </span>
                 </div>
                 <div
                   className="handle handle-right"

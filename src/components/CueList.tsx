@@ -10,6 +10,10 @@ interface CueListProps {
   driftRangeIds: string[] | null;
   /** 区间漂移首个冲突字幕（红色标记）；无冲突为 null */
   driftConflictId: string | null;
+  /** 阅读速度超过阈值的字幕 id 集合；无则空集 */
+  speedOverIds: Set<string>;
+  /** 各字幕阅读速度（字/秒），用于行内角标 */
+  speedCpsById: Map<string, number>;
   /** 变化时强制重新滚动到选中行（定位冲突时选中项可能未变） */
   focusNonce: number;
   onSelect: (id: string) => void;
@@ -24,6 +28,8 @@ export default function CueList({
   selectedId,
   driftRangeIds,
   driftConflictId,
+  speedOverIds,
+  speedCpsById,
   focusNonce,
   onSelect,
   onExtendRange,
@@ -58,7 +64,8 @@ export default function CueList({
                 cue.id === selectedId && 'selected',
                 active && 'playing',
                 driftSet.has(cue.id) && 'in-drift-range',
-                cue.id === driftConflictId && 'drift-conflict'
+                cue.id === driftConflictId && 'drift-conflict',
+                speedOverIds.has(cue.id) && 'speed-over'
               ].filter(Boolean).join(' ')}
               onClick={(e) => {
                 if (e.shiftKey) onExtendRange(cue.id);
@@ -80,7 +87,14 @@ export default function CueList({
                 {secondsToSrtTime(cue.end)}
               </button>
               <div className="cue-row-text">{cue.text}</div>
-              <div className="cue-row-dur">{(cue.end - cue.start).toFixed(2)}s</div>
+              <div className="cue-row-dur">
+                {(cue.end - cue.start).toFixed(2)}s
+                {speedOverIds.has(cue.id) && (
+                  <span className="speed-badge" title="阅读速度超过当前阈值（去空白标点后的字素簇数 ÷ 时长）">
+                    ⏩ {Number.isFinite(speedCpsById.get(cue.id) ?? 0) ? (speedCpsById.get(cue.id) ?? 0).toFixed(1) : '∞'}
+                  </span>
+                )}
+              </div>
             </div>
           );
         })}

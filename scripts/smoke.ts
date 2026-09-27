@@ -49,6 +49,12 @@ import {
   refItemKey,
   summarizeRefDiff
 } from '../src/lib/refdiff';
+import {
+  buildReadingSpeed,
+  countGraphemes,
+  planReadingSpeedFix,
+  readingChars
+} from '../src/lib/readingSpeed';
 
 let fail = 0;
 function assert(cond: boolean, msg: string) {
@@ -714,6 +720,150 @@ assert(validateSession(nullAudio).ok, '无音频指纹的会话合法');
   const emptyRef = buildRefDiff(one, [])!;
   assert(emptyRef.pairs.length === 0 && emptyRef.currentOnly.length === 1, '参考轨为空：全部为当前独有');
   assert(MAX_PAIR_CELLS > 0, '配对矩阵单元格上限为正数');
+}
+
+// 28. 阅读速度：字素簇计数（去空白标点、NFKC、emoji ZWJ 序列）
+{
+  assert(countGraphemes('abc') === 3, 'ASCII 3 字素');
+  assert(countGraphemes('你好') === 2, '中文 2 字素');
+  assert(countGraphemes('é') === 1, '组合字符 e+◌́ 为 1 字素');
+  assert(countGraphemes('👨‍👩‍👧') === 1, 'emoji ZWJ 家庭序列为 1 字素');
+  assert(readingChars('你好， 世界！') === 4, '去中文标点与空白后 4 字');
+  assert(readingChars('  Hello,\nWorld! ') === 10, '去英文标点与空白后 10 字');
+  assert(readingChars('ＡＢＣ．１２３') === 6, '全角 NFKC 折叠后 6 字');
+  assert(readingChars('…— !?') === 0, '纯标点空白为 0 字');
+  assert(readingChars('👍👍') === 2, 'emoji 各算 1 字');
+}
+
+// 29. 阅读速度：超速判定与目标时长（向上取整到毫秒，整除不误加）
+{
+  const speedCues = [
+    { id: 'a', start: 0, end: 1, text: '一二三四五六七八九十一二' }, // 12 字 / 1s = 12 > 10
+    { id: 'b', start: 2, end: 3, text: '一二三四五六七八九十' },     // 10 字 / 1s = 10，恰好不超
+    { id: 'c', start: 4, end: 2, text: 'x' }                        // 非法时长由解析器保证，此处不构造
+  ].filter((c) => c.end > c.start);
+  const metrics = buildReadingSpeed(speedCues, 10);
+  assert(metrics[0].over && !metrics[1].over, '12 字/秒超 10，10 字/秒恰好不超');
+  assert(metrics[0].targetMs === 1200 && metrics[0].extendMs === 200, '12 字 / 10 = 1.2s 目标时长');
+  assert(metrics[1].extendMs === 0, '不超限时无需延长');
+  // 13 字 / 10：1.3s；整除场景 10 字 -> 1000ms 而非 1001
+  assert(buildReadingSpeed([{ id: 'x', start: 0, end: 1, text: '一二三四五六七八九十'.repeat(1) }], 10)[0].targetMs === 1000, '整除目标时长不取整 +1');
+  const m7 = buildReadingSpeed([{ id: 'x', start: 0, end: 1, text: '一二三四五六七' }], 3); // 7 字/3 = 2.333...
+  assert(m7[0].targetMs === 2334, '7/3 字每秒 -> 2334ms（ceil）');
+  // 阈值放大后不再超限
+  assert(buildReadingSpeed(speedCues, 20).every((m) => !m.over), '阈值 20 时无超速条目');
+}
+
+// 30. 阅读速度修复：均分延长、转拨、触限与缺口
+{
+  const SC = { minDuration: 0.3, minGap: 0.1 };
+  // a[0~1] b[2~2.5]（10 字需 500ms） c[5~6]：目标 1.0s，左余 1000、右余 1400
+  const sc = [
+    { id: 'a', start: 0, end: 1, text: 'a' },
+    { id: 'b', start: 2, end: 2.5, text: '一二三四五六七八九十' },
+    { id: 'c', start: 5, end: 6, text: 'c' }
+  ];
+  let fix = planReadingSpeedFix(sc, 'b', 10, SC, 0)!;
+  assert(fix.needMs === 500, 'b 需延长 500ms');
+  assert(fix.left.takeMs === 250 && fix.right.takeMs === 250, '两侧余量充足：均分 250/250');
+  assert(fix.newStartMs === 1750 && fix.newEndMs === 2750, '新起止 1.750 / 2.750');
+  assert(fix.feasible && fix.nextCues !== null, '方案可行并给出 nextCues');
+
+  // 左触限（a.end=1.9，左余 0）：全量 500 转给右侧（右余 2400 充足）
+  const sc2 = [
+    { id: 'a', start: 0, end: 1.9, text: 'a' },
+    { id: 'b', start: 2, end: 2.5, text: '一二三四五六七八九十' },
+    { id: 'c', start: 5, end: 6, text: 'c' }
+  ];
+  fix = planReadingSpeedFix(sc2, 'b', 10, SC, 0)!;
+  assert(fix.left.takeMs === 0 && fix.right.takeMs === 500, `左触限转拨右侧 0/500（实际 ${fix.left.takeMs}/${fix.right.takeMs}）`);
+  assert(fix.left.bound === 'neighbor' && fix.left.neighborIndex === 1, '左侧标记受上一条 #1 限制');
+
+  // 右触限（c.start=2.7，右余 100ms）：左余 1000 充足，400 转给左
+  const sc3 = [
+    { id: 'a', start: 0, end: 1, text: 'a' },
+    { id: 'b', start: 2, end: 2.5, text: '一二三四五六七八九十' },
+    { id: 'c', start: 2.7, end: 6, text: 'c' }
+  ];
+  fix = planReadingSpeedFix(sc3, 'b', 10, SC, 0)!;
+  assert(fix.left.takeMs === 400 && fix.right.takeMs === 100, `右触限转拨左侧 400/100（实际 ${fix.left.takeMs}/${fix.right.takeMs}）`);
+  assert(fix.right.bound === 'neighbor' && fix.right.neighborIndex === 3, '右侧标记受下一条 #3 限制');
+  assert(fix.feasible, '转拨后可行');
+
+  // 两侧余量合计不足：左余 0（a.end=1.9）、右余 100，缺 400
+  const sc4 = [
+    { id: 'a', start: 0, end: 1.9, text: 'a' },
+    { id: 'b', start: 2, end: 2.5, text: '一二三四五六七八九十' },
+    { id: 'c', start: 2.7, end: 6, text: 'c' }
+  ];
+  fix = planReadingSpeedFix(sc4, 'b', 10, SC, 0)!;
+  assert(!fix.feasible && fix.shortfallMs === 400, `两侧余量不足缺 400ms（实际 ${fix.shortfallMs}）`);
+  assert(fix.nextCues === null, '不足时不产生 nextCues（原字幕不变）');
+  assert(fix.left.takeMs === 0 && fix.right.takeMs === 100, `两侧取 0/100（实际 ${fix.left.takeMs}/${fix.right.takeMs}）`);
+
+  // 0s 限制：首条字幕无左邻，起点 0.2，左余 200；右余充足 -> 均分 250 时左先取 200，300 转右
+  const sc5 = [
+    { id: 'b', start: 0.2, end: 0.5, text: '一二三四五六七八九十一二三四' }, // 14 字 / 0.3s，目标 1400ms，需 1100
+    { id: 'c', start: 5, end: 6, text: 'c' }
+  ];
+  fix = planReadingSpeedFix(sc5, 'b', 10, SC, 0)!;
+  assert(fix.needMs === 1100, `需 1100ms（实际 ${fix.needMs}）`);
+  assert(fix.left.takeMs === 200 && fix.left.bound === 'zero', `左侧取满到 0s 并标记 zero（实际 ${fix.left.takeMs}）`);
+  assert(fix.right.takeMs === 900 && fix.feasible, `剩余 900 转右侧（实际 ${fix.right.takeMs}）`);
+
+  // 音频终点限制：无右邻，音频 2.75s 结束 -> 右余 250（均分即触限），左余 1000，250 转左
+  fix = planReadingSpeedFix(sc, 'b', 10, SC, 2.75)!;
+  assert(fix.right.takeMs === 250 && fix.right.bound === 'audio-end', `右侧受音频终点限制取 250（实际 ${fix.right.takeMs}）`);
+  assert(fix.left.takeMs === 250 && fix.feasible, '250 转左侧后可行');
+  // 未加载音频（0）且单条无邻居：两侧余量无限，均分
+  const only = [{ id: 'solo', start: 2, end: 2.5, text: '一二三四五六七八九十' }];
+  fix = planReadingSpeedFix(only, 'solo', 10, SC, 0)!;
+  assert(fix.right.bound === 'none' && Number.isFinite(fix.right.slackMs) === false, '无右邻且无音频：右余无限');
+  assert(fix.left.bound === 'none' && fix.left.takeMs === 250, `无左邻时左限 0s、余量 2000ms 未取满（实际 ${fix.left.takeMs}）`);
+
+  // 音频终点比下一条更紧时取音频：右余 min(2600-2500=100, 2650-2500=150)=100 邻居
+  fix = planReadingSpeedFix(sc3, 'b', 10, SC, 2.65)!;
+  assert(fix.right.takeMs === 100 && fix.right.bound === 'neighbor', '下一条间隔后 2.60 早于音频 2.65，取邻居限制');
+
+  // 初始均分即超过一侧余量：左余 50（a.end=1.85 + 间隔 0.1），右余 950（c.start=3.55）。先取左 50，650 转右
+  const scTightLeft = [
+    { id: 'a', start: 0, end: 1.85, text: 'a' },
+    { id: 'b', start: 2, end: 2.5, text: '一二三四五六七八九十一二' }, // 12 字需 700ms
+    { id: 'c', start: 3.55, end: 6, text: 'c' }
+  ];
+  fix = planReadingSpeedFix(scTightLeft, 'b', 10, SC, 0)!;
+  assert(fix.needMs === 700 && fix.left.takeMs === 50 && fix.right.takeMs === 650, `左触限且初始均分超额：50/650（实际 ${fix.left.takeMs}/${fix.right.takeMs}）`);
+  assert(fix.feasible && fix.left.bound === 'neighbor', '转拨后可行，左标记受上一条限制');
+
+  // 奇数毫秒：1 字 / 4 阈值，1s -> 目标 250ms，需 150ms（已 1s？构造 100ms 时长）
+  const sc6 = [{ id: 'a', start: 1, end: 1.1, text: '一字' }]; // 2 字 / 0.1s，目标 200ms，需 100
+  fix = planReadingSpeedFix(sc6, 'a', 10, SC, 0)!;
+  assert(fix.needMs === 100 && fix.left.takeMs === 50 && fix.right.takeMs === 50, '偶数均分');
+  const sc7 = [{ id: 'a', start: 1, end: 1.1, text: '一二三' }]; // 3 字 / 0.1s，目标 300ms，需 200
+  fix = planReadingSpeedFix(sc7, 'a', 10, SC, 0)!;
+  assert(fix.needMs === 200, '需 200ms');
+  // 奇数验证：3 字 / 0.2s（200ms）阈值 10 -> 300ms 需 100 -> 50/50；用 4 字/0.25 -> 400 需 150
+  const sc8 = [{ id: 'a', start: 1, end: 1.25, text: '一二三四' }];
+  fix = planReadingSpeedFix(sc8, 'a', 10, SC, 0)!;
+  assert(fix.needMs === 150 && fix.left.takeMs === 75 && fix.right.takeMs === 75, `150ms 均分 75/75（实际 ${fix.left.takeMs}/${fix.right.takeMs}）`);
+  // 奇数 101ms：构造 3 字 / 0.199s = 199ms，目标 300，需 101
+  const sc9 = [{ id: 'a', start: 1, end: 1.199, text: '一二三' }];
+  fix = planReadingSpeedFix(sc9, 'a', 10, SC, 0)!;
+  assert(fix.needMs === 101 && fix.left.takeMs === 50 && fix.right.takeMs === 51, `奇数毫秒多 1ms 归右侧 50/51（实际 ${fix.left.takeMs}/${fix.right.takeMs}）`);
+
+  // 失效 id 返回 null
+  assert(planReadingSpeedFix(sc, 'ghost', 10, SC, 0) === null, '锚点失效返回 null');
+
+  // 合法结果作为一次历史记录：可撤销 / 重做，并由现有 SRT 导出
+  const okFix = planReadingSpeedFix(sc, 'b', 10, SC, 0)!;
+  let h4 = initHistory(sc);
+  h4 = commitHistory(h4, okFix.nextCues!);
+  assert(h4.past.length === 1 && h4.present[1].start === 1.75, '速度修复作为一次历史提交');
+  h4 = undoHistory(h4);
+  assert(h4.present[1].start === 2, '撤销还原');
+  h4 = redoHistory(h4);
+  assert(h4.present[1].end === 2.75, '重做恢复');
+  assert(serializeSrt(h4.present).includes('00:00:01,750 --> 00:00:02,750'), '修复结果可由现有 SRT 导出');
 }
 
 process.exit(fail ? 1 : 0);
